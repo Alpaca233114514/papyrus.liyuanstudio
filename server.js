@@ -3,55 +3,180 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE = 'https://api.deepseek.com/v1';
 const PORT = process.env.PORT || 3000;
-const DAILY_QUOTA = 50_000; // 50K tokens per IP per day
+const DAILY_QUOTA_PER_KEY = 500_000; // 50万 tokens per key per day
+
+// Preset keys from env (optional backup/admin keys)
+const PRESET_KEYS = (process.env.API_KEYS || '')
+  .split(',')
+  .map((k) => k.trim())
+  .filter(Boolean);
 
 if (!DEEPSEEK_API_KEY) {
   console.error('Missing DEEPSEEK_API_KEY in .env');
   process.exit(1);
 }
 
-const app = express();
+const USAGE_FILE = path.join(__dirname, 'usage.json');
+const KEYS_FILE = path.join(__dirname, 'keys.json');
 
-app.use(cors());
-app.use(express.json({ limit: '5mb' }));
-
-// In-memory token usage tracker: { "ip": { date: "2026-04-27", tokens: 12345 } }
-const usageMap = new Map();
+let globalUsage = { date: getToday(), tokens: 0 };
+const keyUsageMap = new Map();
+let validKeys = new Set(PRESET_KEYS);
+const registerLog = new Map(); // ip -> { date, count }
 
 function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function getUsage(ip) {
-  const record = usageMap.get(ip);
+function resetIfNewDay() {
   const today = getToday();
-  if (!record || record.date !== today) {
-    const fresh = { date: today, tokens: 0 };
-    usageMap.set(ip, fresh);
-    return fresh;
+  if (globalUsage.date !== today) {
+    globalUsage = { date: today, tokens: 0 };
+    keyUsageMap.clear();
+    registerLog.clear();
   }
-  return record;
 }
 
-function addUsage(ip, tokens) {
-  const record = getUsage(ip);
-  record.tokens += tokens;
+function addUsage(tokens, key) {
+  resetIfNewDay();
+  globalUsage.tokens += tokens;
+  keyUsageMap.set(key, (keyUsageMap.get(key) || 0) + tokens);
 }
 
-// Clean stale entries every hour
-setInterval(() => {
-  const today = getToday();
-  for (const [ip, record] of usageMap) {
-    if (record.date !== today) usageMap.delete(ip);
+function loadUsage() {
+  try {
+    if (fs.existsSync(USAGE_FILE)) {
+      const raw = fs.readFileSync(USAGE_FILE, 'utf-8');
+      const data = JSON.parse(raw);
+      if (data.date === getToday()) {
+        globalUsage = { date: data.date, tokens: data.global || 0 };
+        if (data.keys) {
+          for (const [k, v] of Object.entries(data.keys)) {
+            keyUsageMap.set(k, v);
+          }
+        }
+        console.log(`Loaded usage: ${globalUsage.tokens.toLocaleString()} tokens today`);
+      } else {
+        console.log('Usage file is stale, starting fresh');
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load usage.json:', e.message);
   }
-}, 3600_000).unref();
+}
+
+function saveUsage() {
+  try {
+    resetIfNewDay();
+    const keys = Object.fromEntries(keyUsageMap);
+    const data = { date: globalUsage.date, global: globalUsage.tokens, keys };
+    fs.writeFileSync(USAGE_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Failed to save usage.json:', e.message);
+  }
+}
+
+function loadKeys() {
+  try {
+    if (fs.existsSync(KEYS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8'));
+      const keys = data.keys || [];
+      for (const k of keys) validKeys.add(k);
+    }
+  } catch (e) {
+    console.error('Failed to load keys.json:', e.message);
+  }
+}
+
+function saveKeys() {
+  try {
+    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: [...validKeys] }, null, 2));
+  } catch (e) {
+    console.error('Failed to save keys.json:', e.message);
+  }
+}
+
+function generateKey() {
+  return 'pk-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+const saveInterval = setInterval(() => {
+  saveUsage();
+  saveKeys();
+}, 300_000);
+
+function gracefulExit() {
+  clearInterval(saveInterval);
+  saveUsage();
+  saveKeys();
+  process.exit(0);
+}
+
+process.on('SIGINT', gracefulExit);
+process.on('SIGTERM', gracefulExit);
+
+const app = express();
+app.set('trust proxy', true);
+app.use(cors());
+app.use(express.json({ limit: '5mb' }));
+
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!validKeys.has(token)) {
+    res.status(401).json({
+      error: {
+        message: 'Invalid or missing API key. Get one at POST /v1/register',
+        type: 'authentication_error',
+      },
+    });
+    return;
+  }
+  req.apiKey = token;
+  next();
+}
+
+// POST /v1/register — auto-issue an API key (no auth required)
+app.post('/v1/register', (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const today = getToday();
+
+  resetIfNewDay();
+
+  const log = registerLog.get(ip);
+  if (log && log.date === today && log.count >= 3) {
+    res.status(429).json({
+      error: {
+        message: '该IP今日注册次数已达上限（3次）',
+        type: 'rate_limit_error',
+      },
+    });
+    return;
+  }
+
+  const key = generateKey();
+  validKeys.add(key);
+  saveKeys();
+
+  if (!log || log.date !== today) {
+    registerLog.set(ip, { date: today, count: 1 });
+  } else {
+    log.count++;
+  }
+
+  res.json({
+    api_key: key,
+    message: '请保存此 key，后续请求需在 Authorization 头中以 Bearer <key> 携带',
+  });
+});
 
 // GET /v1/models — connection test endpoint
-app.get('/v1/models', async (_req, res) => {
+app.get('/v1/models', authMiddleware, async (_req, res) => {
   try {
     const resp = await fetch(`${DEEPSEEK_BASE}/models`, {
       headers: { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
@@ -63,24 +188,29 @@ app.get('/v1/models', async (_req, res) => {
   }
 });
 
-// POST /v1/chat/completions — stream proxy with quota
-app.post('/v1/chat/completions', async (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const usage = getUsage(ip);
+// POST /v1/chat/completions — stream proxy with global quota
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+  resetIfNewDay();
 
-  if (usage.tokens >= DAILY_QUOTA) {
+  const used = keyUsageMap.get(req.apiKey) || 0;
+  if (used >= DAILY_QUOTA_PER_KEY) {
     res.status(429).json({
       error: {
-        message: `今日免费额度已用完 (${DAILY_QUOTA.toLocaleString()} tokens/天)。请明天再试，或升级到付费计划。`,
+        message: `今日额度已用完 (${DAILY_QUOTA_PER_KEY.toLocaleString()} tokens/天)。请明天再试。`,
         type: 'quota_exceeded',
-        quota: DAILY_QUOTA,
-        used: usage.tokens,
+        quota: DAILY_QUOTA_PER_KEY,
+        used,
       },
     });
     return;
   }
 
   const isStream = req.body.stream === true;
+
+  const body = { ...req.body };
+  if (isStream) {
+    body.stream_options = { ...body.stream_options, include_usage: true };
+  }
 
   try {
     const upstreamResp = await fetch(`${DEEPSEEK_BASE}/chat/completions`, {
@@ -89,7 +219,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(body),
     });
 
     if (!upstreamResp.ok) {
@@ -114,7 +244,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           const chunk = decoder.decode(value, { stream: true });
           res.write(chunk);
 
-          // Extract usage from the final SSE chunk (contains [DONE] or usage info)
           for (const line of chunk.split('\n')) {
             if (line.startsWith('data: ') && line !== 'data: [DONE]') {
               try {
@@ -130,13 +259,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         reader.releaseLock();
       }
 
-      addUsage(ip, totalTokens);
+      addUsage(totalTokens, req.apiKey);
       res.end();
     } else {
-      // Non-streaming
       const data = await upstreamResp.json();
       const tokens = data.usage?.total_tokens || 0;
-      addUsage(ip, tokens);
+      addUsage(tokens, req.apiKey);
       res.json(data);
     }
   } catch (e) {
@@ -144,17 +272,25 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// GET /v1/usage — check current usage (for debugging / UI)
-app.get('/v1/usage', (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const usage = getUsage(ip);
-  res.json({ ip, date: usage.date, tokens_used: usage.tokens, daily_quota: DAILY_QUOTA });
+// GET /v1/usage — check current key usage
+app.get('/v1/usage', authMiddleware, (req, res) => {
+  resetIfNewDay();
+  const used = keyUsageMap.get(req.apiKey) || 0;
+  res.json({
+    date: globalUsage.date,
+    tokens_used: used,
+    daily_quota: DAILY_QUOTA_PER_KEY,
+    remaining: Math.max(0, DAILY_QUOTA_PER_KEY - used),
+  });
 });
 
 // Serve static landing page for all other routes
 app.use(express.static(path.join(__dirname), { index: 'index.html' }));
 
+loadUsage();
+loadKeys();
 app.listen(PORT, () => {
   console.log(`Papyrus LiYuan DeepSeek Proxy running on port ${PORT}`);
-  console.log(`Daily quota: ${DAILY_QUOTA.toLocaleString()} tokens per IP`);
+  console.log(`Daily quota: ${DAILY_QUOTA_PER_KEY.toLocaleString()} tokens per key`);
+  console.log(`Preset keys: ${PRESET_KEYS.length}, Registered keys: ${validKeys.size - PRESET_KEYS.length}`);
 });
