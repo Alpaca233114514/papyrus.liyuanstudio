@@ -8,7 +8,7 @@ const fs = require('fs');
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE = 'https://api.deepseek.com/v1';
 const PORT = process.env.PORT || 3000;
-const DAILY_QUOTA_PER_KEY = 500_000; // 50万 tokens per key per day
+const DAILY_QUOTA_PER_KEY = 1_000_000; // 100万 tokens per key per day
 
 // Preset keys from env (optional backup/admin keys)
 const PRESET_KEYS = (process.env.API_KEYS || '')
